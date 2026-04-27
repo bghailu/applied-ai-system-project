@@ -1,201 +1,228 @@
 # PawPal+
 
-A Streamlit app that helps a pet owner plan daily care tasks — originally built as a rule-based scheduling system, then extended with a Retrieval-Augmented Generation (RAG) layer so an LLM can refine the plan using real calendar and pet health data.
+A Streamlit app that helps a pet owner plan daily pet care tasks. Built in two stages: first as a rule-based priority scheduler (Modules 1–3), then extended with a Retrieval-Augmented Generation layer that lets a language model refine the plan using the owner's real calendar and pet health records.
 
 ---
 
-## Original project (Module 2)
+## Original project — PawPal+ Scheduler (Modules 1–3)
 
-The core of PawPal+ is a deterministic daily scheduler built around four Python classes in [`pawpal_system.py`](pawpal_system.py):
-
-| Class | Purpose |
-|---|---|
-| `Pet` | Stores a pet's name and species |
-| `Owner` | Stores the owner's name and available time window |
-| `Task` | A care task with duration, priority, frequency, and scheduling state |
-| `DailyPlan` | Coordinates scheduling across all tasks for a given day |
-
-`DailyPlan.generate()` sorts tasks by priority (1 = high) then duration, and packs them sequentially into the owner's available time window. Tasks that don't fit are left unscheduled. The scheduler also supports:
-
-- **Conflict detection** — `detect_conflicts()` flags overlapping time windows
-- **Recurring tasks** — marking a `daily` or `weekly` task complete automatically creates the next occurrence
-- **Filtering and sorting** — `filter_tasks()` and `sort_by_time()` for viewing subsets of the plan
-
-The Streamlit UI in [`app.py`](app.py) lets the owner enter their info, add pets, build a task list, generate the schedule, and mark tasks done.
+**PawPal+ Scheduler** was built to solve a straightforward problem: a busy pet owner needs to fit multiple care tasks — walks, feeding, medication, grooming — into a limited time window each day, without forgetting anything or letting high-priority tasks get pushed aside. The original system let an owner define their available hours and a list of tasks with priorities and durations, then automatically generated a time-blocked daily plan. It supported recurring tasks (daily and weekly), detected scheduling conflicts, and let the owner mark tasks complete — with recurring ones rolling forward to the next due date automatically.
 
 ---
 
-## RAG extension (Module 3)
+## Title and summary
 
-The original scheduler has no awareness of context — it doesn't know the owner has a 2pm meeting, or that one of the pets is recovering from surgery. The RAG extension adds that awareness by letting the owner upload their own calendar and pet health records, indexing them locally, and using a language model to refine the baseline plan with concrete, grounded reasoning.
+**PawPal+ with RAG** extends the original scheduler by making it context-aware. The rule-based engine is good at fitting tasks into time, but it has no knowledge of the outside world — it doesn't know the owner has a noon lunch where they can't walk the dog, or that a pet is recovering from surgery and should avoid strenuous play. The RAG layer lets the owner upload their own calendar events and pet health records, indexes them locally with ChromaDB, and retrieves the most relevant snippets when generating a plan. Those snippets are sent to Google Gemini alongside the rule-based schedule, and the model returns concrete suggested adjustments with reasoning grounded in the uploaded data.
 
-### How it works
+This matters because context is what separates a useful plan from a merely correct one. The system keeps the deterministic scheduler as the source of truth and positions the LLM as an advisor — the owner reads the AI's reasoning and decides whether to act on it, which keeps a human in the loop for any change that affects real pet care.
+
+---
+
+## Architecture overview
+
+The system has four layers:
 
 ```
-User uploads files
-        │
-        ▼
-  RagIndex (rag.py)
-  ChromaDB — local vector store
-  MiniLM embeddings (bundled, offline after first download)
-        │
-        │  on "Generate AI plan"
-        ▼
-  DailyPlan.generate_with_ai()
-    1. run rule-based generate() → baseline plan
-    2. query ChromaDB with task names + date → top-k calendar & health docs
-    3. send baseline plan + retrieved docs to Gemini
-        │
-        ▼
-  GeminiClient (llm.py)
-  Google Gemini API
-        │
-        ▼
-  AI refinement displayed alongside the rule-based plan
+┌─────────────────────────────────────────────┐
+│               Streamlit UI (app.py)         │
+│  Owner/Pets form · Tasks · Knowledge Base   │
+│  Generate schedule · Generate AI plan       │
+└────────────┬──────────────┬─────────────────┘
+             │              │
+             ▼              ▼
+┌────────────────┐   ┌──────────────────────────────┐
+│  Domain layer  │   │        RAG layer (rag.py)     │
+│ pawpal_system  │   │  RagIndex → ChromaDB          │
+│                │   │  MiniLM embeddings (local)    │
+│ Pet  Owner     │   │  one collection, source_type  │
+│ Task DailyPlan │   │  metadata: calendar | health  │
+│                │   └──────────────┬───────────────┘
+│ generate()     │                  │ top-k docs
+│ rule-based     │◄─────────────────┤
+│                │                  ▼
+│ generate_      │   ┌──────────────────────────────┐
+│  with_ai()     │──►│      LLM layer (llm.py)      │
+└────────────────┘   │  GeminiClient                │
+                     │  builds prompt, calls Gemini  │
+                     │  returns ai_summary (text)    │
+                     └──────────────────────────────┘
 ```
 
-**Key design decision:** the AI output is advisory — it never overwrites `task.start_time`. The rule-based plan is always the source of truth. Gemini's response appears in a separate "AI refinement" section with a "Retrieved context" expander showing exactly what snippets the model saw.
+**Data flow for "Generate AI plan":**
+1. `DailyPlan.generate()` runs first — produces the deterministic baseline
+2. A query is built per task (e.g., `"Mochi Administer medication 2026-04-26"`) and sent to `RagIndex.query()`, which performs a semantic search against the ChromaDB collection
+3. The top-k calendar and health documents are de-duplicated and forwarded to `GeminiClient.refine_plan()`
+4. Gemini receives the rule-based summary, retrieved snippets, owner info, and task list, and returns suggested adjustments with reasoning
+5. The AI output is stored as `plan.ai_summary` — it never modifies `task.start_time`
 
-### New files
-
-| File | Role |
-|---|---|
-| [`rag.py`](rag.py) | `RagIndex` — indexes and queries markdown/JSON knowledge docs via ChromaDB |
-| [`llm.py`](llm.py) | `GeminiClient` — builds the prompt and calls the Gemini API |
-| [`data/sample_calendar.md`](data/sample_calendar.md) | Example calendar events in markdown format |
-| [`data/sample_health.json`](data/sample_health.json) | Example pet health records in JSON format |
-| [`tests/test_rag.py`](tests/test_rag.py) | Tests for RAG indexing, API key validation, and the AI generation flow |
+The UI renders both outputs side by side: the unchanged rule-based plan, then the AI refinement section with a "Retrieved context" expander showing exactly which snippets the model used.
 
 ---
 
 ## Setup
 
+**Prerequisites:** Python 3.10+, a Gemini API key (get one free at [aistudio.google.com](https://aistudio.google.com))
+
 ```bash
-# 1. Clone and enter the project
+# 1. Clone the repository
 git clone <repo-url>
 cd applied-ai-system-project
 
-# 2. Create a virtual environment
+# 2. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
-# Note: ChromaDB downloads its MiniLM embedding model (~80 MB) on first use.
-# After that it runs fully offline.
-
-# 4. Add your Gemini API key
-cp .env.example .env
-# Open .env and set:  GEMINI_API_KEY=your_key_here
 ```
 
-Get a Gemini API key at [aistudio.google.com](https://aistudio.google.com).
-
----
-
-## Running the app
+> On the first run, ChromaDB downloads its MiniLM ONNX embedding model (~80 MB). This requires an internet connection once — after that the model is cached locally and the app runs fully offline except for Gemini API calls.
 
 ```bash
+# 4. Configure your API key
+cp .env.example .env
+# Open .env and fill in:
+#   GEMINI_API_KEY=your_key_here
+
+# 5. Launch the app
 streamlit run app.py
 ```
 
----
-
-## Example workflow
-
-### 1. Set up owner and pets
-
-Fill in your name and available time window (e.g., 8:00 AM – 6:00 PM), then add one or more pets. Click **Save Owner** and **Add Pet** to confirm.
-
-### 2. Add tasks
-
-For each care task, set a title, pick which pet it's for, enter a duration in minutes, choose a priority (high / medium / low), and select a frequency (one-time, daily, or weekly). Click **Add task**.
-
-Example tasks:
-- Morning walk — Buddy — 30 min — high — daily
-- Feed breakfast — Buddy — 10 min — high — daily
-- Administer medication — Mochi — 5 min — high — daily
-- Clean litter box — Mochi — 10 min — medium — daily
-- Enrichment play — Buddy — 20 min — low — weekly
-
-### 3. Load the knowledge base
-
-Upload your calendar and health files in the **Knowledge Base** section. You can use the sample files in `data/` to try it out:
-
-- `data/sample_calendar.md` — markdown file with one event per `---`-separated block
-- `data/sample_health.json` — JSON array of health records
-
-Click **Build / refresh index**. The caption will show how many documents were indexed.
-
-**Calendar JSON shape:**
-```json
-[{"title": "Vet appointment", "date": "2026-04-26", "start": "14:00", "end": "15:00", "notes": "..."}]
-```
-
-**Health JSON shape:**
-```json
-[{"pet": "Mochi", "date": "2026-04-20", "type": "medication", "notes": "..."}]
-```
-
-### 4. Generate a plan
-
-**Option A — Rule-based only:** click **Generate schedule** to produce the deterministic priority-sorted plan with no LLM involved.
-
-**Option B — AI-augmented:** click **Generate AI plan**. This runs the rule-based scheduler first, retrieves the most relevant calendar and health snippets for each task and the day's time window, and sends everything to Gemini. The result shows:
-
-- The rule-based schedule (same as Option A — unchanged)
-- **AI refinement** — Gemini's suggested adjustments and reasoning, referencing specific items from your uploaded files (e.g., "move the morning walk earlier — Buddy has a vet appointment at 2pm and should not eat for 2 hours before")
-- **Retrieved context** expander — the exact calendar and health snippets the model used
-
-### 5. Mark tasks complete
-
-Click **Done** next to any scheduled task to mark it complete. Recurring tasks (daily / weekly) automatically generate their next occurrence.
-
----
-
-## Running tests
-
 ```bash
+# Run tests (no API key or network needed)
 pytest -v
 ```
 
-5 tests total — 2 for the original scheduler, 3 for the RAG and LLM layer (no network calls; Gemini is mocked).
+---
+
+## Sample interactions
+
+### Interaction 1 — Rule-based schedule only
+
+**Input:**
+- Owner: Jordan, available 8:00 AM – 6:00 PM
+- Pets: Buddy (dog), Mochi (cat)
+- Tasks:
+  - Morning walk — Buddy — 30 min — high — daily
+  - Feed breakfast — Buddy — 10 min — high — daily
+  - Administer medication — Mochi — 5 min — high — daily
+  - Clean litter box — Mochi — 10 min — medium — daily
+  - Enrichment play — Buddy — 20 min — low — weekly
+
+**Action:** Click **Generate schedule**
+
+**Output:**
+```
+Scheduled tasks:
+  ○ 08:00 AM – 08:30 AM  — Morning walk (Buddy)
+  ○ 08:30 AM – 08:40 AM  — Feed breakfast (Buddy)
+  ○ 08:40 AM – 08:45 AM  — Administer medication (Mochi)
+  ○ 08:45 AM – 08:55 AM  — Clean litter box (Mochi)
+  ○ 08:55 AM – 09:15 AM  — Enrichment play (Buddy)
+
+Total time scheduled: 75 min of 600 min available.
+```
+
+Tasks are placed in priority order (high → medium → low), with shorter tasks breaking ties. All five fit, so nothing is left unscheduled.
 
 ---
 
-## Reflection on AI collaboration and system design
+### Interaction 2 — AI-augmented plan with calendar context
 
-### How I used AI during development
+**Input:** Same owner, pets, and tasks as above.
 
-I used Claude as a collaborator throughout the RAG extension — for design decisions, code generation, and debugging. Before accepting any suggestion I made sure I could explain what the code does and why, so that if something broke I could reason about it rather than just re-prompting until it passed.
+**Knowledge base uploaded:**
+- `data/sample_calendar.md` — includes a 2:00–3:00 PM vet appointment for Mochi and a noon lunch where the owner is out of the apartment
+- `data/sample_health.json` — includes a note that Mochi is on a 7-day antibiotic course (twice daily with food) and that Buddy has mild arthritis and should keep walks gentle
 
-In practice that looked like three things. First, I had the AI explore the existing codebase and map the architecture before writing anything, so its suggestions were grounded in the actual code rather than generic patterns. Second, I asked it clarifying questions in stages — data ingestion approach, LLM role, vector store choice — rather than giving one vague prompt and accepting whatever came back. Third, I read every generated file before letting it run, and ran the tests myself to verify the output was correct, not just plausible.
+**Action:** Click **Generate AI plan**
 
- AI-generated code can look correct and still be wrong in subtle ways. The tests were the contract — if they passed, the implementation was trustworthy; if they didn't, I had to understand the failure rather than just ask the AI to patch it.
+**Retrieved context (shown in expander):**
+- *Calendar:* "Vet appointment for Mochi — 2026-04-26 14:00–15:00: Annual checkup at Bayside Animal Clinic. Mochi should not eat for 2 hours before the visit."
+- *Calendar:* "Lunch with Sam — 2026-04-26 12:00–13:00: Out of the apartment, cannot walk dogs during this window."
+- *Health:* "Mochi 2026-04-20 medication: Started a 7-day antibiotic course (amoxicillin), 1 pill twice daily with food. Last dose 2026-04-27."
+- *Health:* "Buddy 2026-04-10 condition: Senior dog with mild arthritis in hind legs. Keep walks gentle and limit stairs."
+
+**AI refinement output:**
+
+```
+## Suggested adjustments
+
+- Keep the morning walk at 8:00 AM as scheduled — this is the right window
+  given the noon lunch absence and the afternoon vet appointment.
+- For Buddy's morning walk, keep the pace gentle and avoid stairs; his
+  arthritis note says strenuous activity should be limited.
+- Schedule a second medication dose for Mochi around 6:00 PM (with her
+  evening meal) to complete the twice-daily antibiotic course.
+- Do not feed Mochi within 2 hours of the 2:00 PM vet appointment —
+  her last meal should be no later than noon.
+- Enrichment play for Buddy is fine in the morning slot; avoid scheduling
+  any active play after the vet visit in case Mochi needs rest.
+
+## Reasoning
+
+The calendar shows two constraints that the rule-based scheduler couldn't
+see: the owner is out at noon and Mochi has a vet appointment at 2 PM with
+a fasting requirement. The health records add two more: Buddy's arthritis
+means the morning walk should be low-impact, and Mochi's antibiotic
+requires a second dose later in the day with food. The baseline plan places
+all tasks in the morning, which is correct given those afternoon constraints,
+but it misses the second medication dose entirely and doesn't account for
+the pre-vet fasting window.
+```
 
 ---
 
-### One helpful suggestion
+### Interaction 3 — Missing API key guard
 
-The most consequential design decision the AI recommended was making the LLM output **advisory only** — storing Gemini's response as `ai_summary` on the plan instance, but never overwriting `task.start_time`. Its argument: if the model hallucinates a time or misreads the context, the user's actual schedule stays intact. The rule-based plan is always the source of truth.
+**Input:** Same setup, but `GEMINI_API_KEY` is not set in `.env`.
 
-This is responsible AI design at the system level. Any time an LLM output can affect a user's real-world actions — in this case, when they care for their pet — there should be a human review step before that output is acted on. Displaying the AI refinement as a suggestion the owner reads and decides to apply, rather than a change that silently happens, keeps the human in the loop. I kept this recommendation exactly as proposed.
+**Action:** Click **Generate AI plan**
+
+**Output:**
+```
+GEMINI_API_KEY missing in .env — AI plan disabled.
+```
+
+The rule-based schedule is unaffected and still usable. No crash, no partial state.
 
 ---
 
-### One flawed suggestion
+## Design decisions
 
-The AI specified `google-generativeai` as the Gemini SDK. When I ran pytest after implementation, the output included a `FutureWarning` that the package had been deprecated in favour of `google-genai` and would no longer receive bug fixes.
+**One ChromaDB collection, not two.** An early option was to use separate collections for calendar and health records. A single collection with a `source_type` metadata field was simpler — one client handle, one `reset()` call, and `query()` accepts an optional `source_type` filter when you need to search only one category. For a project of this scale the added flexibility of separate collections wasn't worth the extra surface area.
+
+**AI output is advisory, not authoritative.** Gemini's response is stored as free text on `plan.ai_summary` and displayed as a suggestion — it never writes back to `task.start_time`. This was a deliberate responsible-AI choice: the LLM can hallucinate times or misread context, and any error in pet care (missed medication, walking a dog before a vet's fasting window) has real consequences. Keeping the human in the loop before any AI suggestion is acted on was more important than making the app feel more automated.
+
+**Rule-based scheduler runs first, every time.** `generate_with_ai()` always calls `self.generate()` as its first step. This means the deterministic plan is always available regardless of whether the LLM call succeeds, and the AI refines a concrete baseline rather than reasoning from scratch. It also made testing easier: the rule-based times before and after the AI call could be compared directly.
+
+**No structured JSON output from Gemini.** Asking Gemini to return a JSON diff of proposed task changes would enable an "Apply suggestions" button, but it would also make the model's reasoning harder to read and inspect. Free-text output is more transparent — the owner can read the reasoning and decide whether it's sound before acting on it. The trade-off is that applying a suggestion requires the owner to manually adjust tasks.
 
 ---
 
-### System limitations and future improvements
+## Testing summary
 
-**Free-text output limits automation.** Because Gemini returns markdown prose, the app can display suggestions but cannot apply them automatically. A structured output contract (asking the model to return JSON with proposed task changes) would enable an "Apply suggestions" button — but it would also make the model's reasoning less transparent. That tradeoff deserves deliberate attention, not just implementation convenience.
+**What worked well:** The three RAG tests cover the most important failure modes without hitting the network. `test_index_markdown_retrieves` confirms that ChromaDB's default embeddings produce semantically meaningful results — querying "vet visit for the cat" against a collection containing a "Vet appointment for Mochi" block returns the right document. `test_gemini_client_missing_api_key` catches the most common setup mistake cleanly. `test_generate_with_ai_uses_mocked_llm` gives end-to-end confidence that the two-pass flow (rule-based then LLM) works and that the AI does not mutate task times.
 
-**No persistence.** Owner info, pets, tasks, and the plan all live in Streamlit session state and disappear on refresh. Responsible handling of any persistent user data — even something as low-stakes as pet care tasks — would require thinking about storage, access control, and what happens when data is deleted.
+**What didn't work initially:** The monkeypatching in `test_generate_with_ai_uses_mocked_llm` required patching `llm.genai.GenerativeModel` (the reference inside the `llm` module) rather than `google.generativeai.GenerativeModel` (the global namespace). Patching the wrong target left the real import in place and the test would have made a live API call. This is a subtle Python import behaviour that wasn't obvious until the test was inspected carefully.
 
-**Retrieval quality degrades with generic queries.** The RAG queries are built from task names and the plan date. A health record phrased differently from the query may not surface, which means the LLM could give advice without seeing a relevant record that exists in the knowledge base. A future version could improve this with better query construction, date-range metadata filtering, or showing the owner which records were *not* retrieved so they can judge whether the model had enough context.
+**What I learned:** Running tests immediately after writing code caught the deprecated-SDK warning (`google-generativeai` is end-of-life, replaced by `google-genai`) before it became a deeper issue. Tests don't just verify logic — they surface environment and dependency problems that a code review alone would miss. The 5-test suite (2 original + 3 new) passes in about 20 seconds on a first run while ChromaDB's embedding model initialises, and in under 5 seconds on subsequent runs once the model is cached.
+
+---
+
+## Reflection
+
+**What this project taught me about AI**
+
+The most useful thing I learned is the difference between AI as an autocomplete tool and AI as a design collaborator. When I used Claude to just generate code, the results were faster but shallow — I got working implementations of things I already knew how to build. When I used it to push back on architectural choices ("should the LLM replace the scheduler or augment it?", "one collection or two?"), the conversation surfaced trade-offs I hadn't thought through and the final design was better for it.
+
+Responsible use meant maintaining understanding at every step. I set a rule for myself: if I couldn't explain why a piece of generated code was correct, I wouldn't commit it. That standard caught the deprecated SDK issue, forced me to actually understand the ChromaDB query API, and meant that when a test failed I could reason about it rather than just re-prompting. AI tools lower the cost of building things, but they don't lower the cost of understanding what you've built — that understanding is still entirely on you.
+
+**What this project taught me about problem-solving**
+
+RAG forced me to think in two separate layers that need to be designed independently but work together: retrieval quality and generation quality. A well-written prompt does nothing if the retrieved documents are irrelevant, and good retrieval does nothing if the prompt doesn't give the model a clear task. Debugging the system required thinking about both at once — when the AI gave a weak response, the first question was always "did the right documents get retrieved?" rather than "is the prompt wrong?".
+
+The advisory-only design decision also taught me something about building AI features into real systems: the question "what happens when the AI is wrong?" should be answered in the architecture, not in a disclaimer. Designing the system so that an AI error cannot corrupt the user's plan was more trustworthy than adding a warning label after the fact.
 
 ---
 
@@ -206,14 +233,14 @@ applied-ai-system-project/
 ├── app.py                  # Streamlit UI
 ├── pawpal_system.py        # Core domain: Pet, Owner, Task, DailyPlan
 ├── rag.py                  # RagIndex — ChromaDB-backed knowledge retrieval
-├── llm.py                  # GeminiClient — LLM refinement via Gemini API
+├── llm.py                  # GeminiClient — prompt builder + Gemini API call
 ├── main.py                 # CLI demo script
 ├── data/
 │   ├── sample_calendar.md  # Example calendar events (markdown)
 │   └── sample_health.json  # Example pet health records (JSON)
 ├── tests/
-│   ├── test_pawpal.py      # Scheduler tests
-│   └── test_rag.py         # RAG + LLM tests
+│   ├── test_pawpal.py      # Original scheduler tests
+│   └── test_rag.py         # RAG indexing, API key, and AI generation tests
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
