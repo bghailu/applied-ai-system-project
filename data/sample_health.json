@@ -1,0 +1,26 @@
+[
+  {
+    "pet": "Mochi",
+    "date": "2026-04-20",
+    "type": "medication",
+    "notes": "Started a 7-day antibiotic course (amoxicillin), 1 pill twice daily with food. Last dose 2026-04-27."
+  },
+  {
+    "pet": "Mochi",
+    "date": "2026-04-15",
+    "type": "vet visit",
+    "notes": "Mild ear infection diagnosed. Recovering well. Avoid strenuous play for 10 days."
+  },
+  {
+    "pet": "Buddy",
+    "date": "2026-04-10",
+    "type": "condition",
+    "notes": "Senior dog with mild arthritis in hind legs. Keep walks gentle and limit stairs."
+  },
+  {
+    "pet": "Buddy",
+    "date": "2026-04-22",
+    "type": "diet",
+    "notes": "Switched to weight-management kibble. Two small meals per day, no table scraps."
+  }
+]

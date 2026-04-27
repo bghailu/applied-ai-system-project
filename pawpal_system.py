@@ -157,6 +157,40 @@ class DailyPlan:
         scheduled = self.scheduled_tasks()
         return sorted(scheduled, key=lambda t: t.start_time.strftime("%H:%M"))
 
+    def generate_with_ai(self, rag_index, llm_client) -> None:
+        # Rule-based plan stays the source of truth
+        self.generate()
+
+        queries = [
+            f"{t.pet.name} {t.name} {self.plan_date.isoformat()}"
+            for t in self.tasks
+        ]
+        window_q = (
+            f"{self.plan_date.isoformat()} "
+            f"{self.owner.available_start.strftime('%H:%M')}-"
+            f"{self.owner.available_end.strftime('%H:%M')}"
+        )
+
+        cal_docs: list[dict] = []
+        health_docs: list[dict] = []
+        for q in queries + [window_q]:
+            cal_docs += rag_index.query(q, source_type="calendar", k=2)
+            health_docs += rag_index.query(q, source_type="health", k=2)
+
+        cal_docs = list({d["document"]: d for d in cal_docs}.values())
+        health_docs = list({d["document"]: d for d in health_docs}.values())
+
+        result = llm_client.refine_plan(
+            self.summary(),
+            cal_docs,
+            health_docs,
+            self.owner,
+            [t.pet for t in self.tasks],
+            self.tasks,
+        )
+        self.ai_summary = result["summary"]
+        self.ai_context = {"calendar": cal_docs, "health": health_docs}
+
     def summary(self) -> str:
         lines = [f"Daily Plan for {self.owner.name} — {self.plan_date.strftime('%A, %B %d %Y')}"]
         lines.append(f"Available window: {self.owner.available_start.strftime('%I:%M %p')} – "

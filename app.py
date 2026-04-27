@@ -1,6 +1,15 @@
+import json
+import os
+
 import streamlit as st
 from datetime import date, time
+from dotenv import load_dotenv
+
 import pawpal_system as ps
+from rag import RagIndex
+
+
+load_dotenv()
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 st.title("🐾 PawPal+")
@@ -131,6 +140,75 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# Knowledge Base (RAG)
+# ---------------------------------------------------------------------------
+st.subheader("Knowledge Base")
+st.caption(
+    "Upload owner calendar files and pet health records (Markdown or JSON). "
+    "These are indexed locally with ChromaDB and used to ground the AI plan."
+)
+
+cal_uploads = st.file_uploader(
+    "Calendar files",
+    type=["md", "json"],
+    accept_multiple_files=True,
+    key="cal_uploads",
+)
+health_uploads = st.file_uploader(
+    "Health records",
+    type=["md", "json"],
+    accept_multiple_files=True,
+    key="health_uploads",
+)
+
+
+def _index_uploads(rag: RagIndex, files, source_type: str) -> int:
+    total = 0
+    for f in files or []:
+        raw = f.read()
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        if f.name.lower().endswith(".json"):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as e:
+                st.error(f"{f.name}: invalid JSON ({e})")
+                continue
+            if not isinstance(data, list):
+                st.error(f"{f.name}: expected a JSON list of objects")
+                continue
+            total += rag.index_json(data, source_type=source_type, source_name=f.name)
+        else:
+            total += rag.index_markdown(text, source_type=source_type, source_name=f.name)
+    return total
+
+
+col_build, col_reset = st.columns(2)
+with col_build:
+    if st.button("Build / refresh index"):
+        if "rag" not in st.session_state:
+            st.session_state.rag = RagIndex()
+        rag = st.session_state.rag
+        added = 0
+        added += _index_uploads(rag, cal_uploads, "calendar")
+        added += _index_uploads(rag, health_uploads, "health")
+        if added:
+            st.success(f"Indexed {added} new docs — total {rag.count()}")
+        else:
+            st.info("No files to index. Upload calendar or health files first.")
+with col_reset:
+    if st.button("Reset index"):
+        if "rag" in st.session_state:
+            st.session_state.rag.reset()
+            st.success("Knowledge base cleared.")
+        else:
+            st.info("Nothing to reset.")
+
+if "rag" in st.session_state:
+    st.caption(f"Indexed documents: **{st.session_state.rag.count()}**")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # Generate Schedule
 # ---------------------------------------------------------------------------
 st.subheader("Build Schedule")
@@ -138,7 +216,13 @@ st.subheader("Build Schedule")
 if "plan" not in st.session_state:
     st.session_state.plan = None
 
-if st.button("Generate schedule"):
+col_gen, col_ai = st.columns(2)
+with col_gen:
+    gen_clicked = st.button("Generate schedule")
+with col_ai:
+    ai_clicked = st.button("Generate AI plan")
+
+if gen_clicked:
     if "owner" not in st.session_state:
         st.warning("Set an owner and pet first.")
     elif not st.session_state.tasks:
@@ -151,6 +235,30 @@ if st.button("Generate schedule"):
         )
         plan.generate()
         st.session_state.plan = plan
+
+if ai_clicked:
+    if "owner" not in st.session_state:
+        st.warning("Set an owner and pet first.")
+    elif not st.session_state.tasks:
+        st.warning("Add at least one task before generating a schedule.")
+    elif not os.getenv("GEMINI_API_KEY"):
+        st.error("GEMINI_API_KEY missing in .env — AI plan disabled.")
+    elif st.session_state.get("rag") is None or st.session_state.rag.count() == 0:
+        st.warning("Upload and index knowledge base files first.")
+    else:
+        from llm import GeminiClient
+
+        plan = ps.DailyPlan(
+            owner=st.session_state.owner,
+            tasks=list(st.session_state.tasks),
+            plan_date=date.today(),
+        )
+        try:
+            with st.spinner("Asking Gemini to refine the plan…"):
+                plan.generate_with_ai(st.session_state.rag, GeminiClient())
+            st.session_state.plan = plan
+        except Exception as e:
+            st.error(f"AI plan failed: {e}")
 
 if st.session_state.get("plan"):
     plan = st.session_state.plan
@@ -192,3 +300,24 @@ if st.session_state.get("plan"):
         st.warning(f"{len(unscheduled)} task(s) didn't fit in the available window.")
         for task in unscheduled:
             st.write(f"  - {task.name} ({task.pet.name}, {task.duration_minutes} min)")
+
+    if getattr(plan, "ai_summary", None):
+        st.divider()
+        st.subheader("AI refinement")
+        st.markdown(plan.ai_summary)
+        ctx = getattr(plan, "ai_context", {}) or {}
+        with st.expander("Retrieved context"):
+            cal = ctx.get("calendar", [])
+            health = ctx.get("health", [])
+            st.markdown("**Calendar**")
+            if cal:
+                for d in cal:
+                    st.write(f"- {d['document']}")
+            else:
+                st.caption("(none retrieved)")
+            st.markdown("**Health**")
+            if health:
+                for d in health:
+                    st.write(f"- {d['document']}")
+            else:
+                st.caption("(none retrieved)")
